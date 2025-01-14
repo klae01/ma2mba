@@ -1,4 +1,4 @@
-# Mamba
+# Ma2mba
 
 ![Mamba](assets/selection.png "Selective State Space")
 > **Mamba: Linear-Time Sequence Modeling with Selective State Spaces**\
@@ -19,20 +19,16 @@
 
 ## About
 
-Mamba is a new state space model architecture showing promising performance on information-dense data such as language modeling, where previous subquadratic models fall short of Transformers.
+Ma2mba optimizes memory usage by leveraging multi-axis gradient checkpointing, ensuring that memory scales independently of the number of layers. This advancement makes Ma2mba a powerful extension to Mamba, particularly for long-sequence tasks such as language modeling, long video processing, and genomic sequence analysis.
+
+Mamba itself is a state space model architecture showing promising performance on information-dense data such as language modeling, where previous subquadratic models fall short of Transformers.
 It is based on the line of progress on [structured state space models](https://github.com/state-spaces/s4),
 with an efficient hardware-aware design and implementation in the spirit of [FlashAttention](https://github.com/Dao-AILab/flash-attention).
 
 ## Installation
 
-- [Option] `pip install causal-conv1d>=1.4.0`: an efficient implementation of a simple causal Conv1d layer used inside the Mamba block.
-- `pip install mamba-ssm`: the core Mamba package.
-- `pip install mamba-ssm[causal-conv1d]`: To install core Mamba package and causal-conv1d.
-- `pip install mamba-ssm[dev]`: To install core Mamba package and dev depdencies.
-
-It can also be built from source with `pip install .` from this repository.
-
-Try passing `--no-build-isolation` to `pip` if installation encounters difficulties either when building from source or installing from PyPi. Common `pip` complaints that can be resolved in this way include PyTorch versions, but other cases exist as well.
+- `MAMBA_FORCE_BUILD=TRUE pip install . --no-build-isolation --no-binary :all:`
+- `pip install causal-conv1d>=1.4.0 triton`
 
 Other requirements:
 - Linux
@@ -101,24 +97,20 @@ assert y.shape == x.shape
 A minimal version of the inner SSD module (Listing 1 from the Mamba-2 paper) with conversion between "discrete" and "continuous" SSM versions
 is at [modules/ssd_minimal.py](mamba_ssm/modules/ssd_minimal.py).
 
-### Mamba Language Model
+### Mamba Language Model with Gradient Checkpointing
 
-Finally, we provide an example of a complete language model: a deep sequence model backbone (with repeating Mamba blocks) + language model head.
+The Mamba Language Model demonstrates how to integrate a deep sequence model backbone (repeating Mamba blocks) with a language model head. To optimize memory usage for long sequences, **Multi-Axis Gradient Checkpointing** is supported, ensuring efficient training without modifying the original architecture.
 
 Source: [models/mixer_seq_simple.py](mamba_ssm/models/mixer_seq_simple.py).
-
-This is an example of how to integrate Mamba into an end-to-end neural network.
-This example is used in the generation scripts below.
-
-### Gradient Checkpointing
-
-The Mamba-2 model supports **Multi-Axis Gradient Checkpointing** for efficient long-sequence processing with reduced memory usage.
 
 ```python
 import torch
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
+# Load the pretrained model
 model = MambaLMHeadModel.from_pretrained("state-spaces/mamba2-2.7b", device="cuda", dtype=torch.bfloat16)
+
+# Enable multi-axis gradient checkpointing
 model.gradient_checkpointing_enable()
 
 vocab_size = model.config.vocab_size
