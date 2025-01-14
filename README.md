@@ -11,6 +11,12 @@
 > Tri Dao*, Albert Gu*\
 > Paper: https://arxiv.org/abs/2405.21060
 
+![Ma2mba](assets/efficient_magc.png "Multi-Axis Gradient Checkpointing")  
+> **Look Every Frame All at Once: Video-Ma<sup>2</sup>mba for Efficient Long-form Video Understanding**\
+> **with Multi-Axis Gradient Checkpointing**\
+> Hosu Lee*, Junho Kim*, Hyunjun Kim, Yong Man Ro\
+> Paper: https://arxiv.org/abs/2411.19460
+
 ## About
 
 Mamba is a new state space model architecture showing promising performance on information-dense data such as language modeling, where previous subquadratic models fall short of Transformers.
@@ -103,6 +109,65 @@ Source: [models/mixer_seq_simple.py](mamba_ssm/models/mixer_seq_simple.py).
 
 This is an example of how to integrate Mamba into an end-to-end neural network.
 This example is used in the generation scripts below.
+
+### Gradient Checkpointing
+
+The Mamba-2 model supports **Multi-Axis Gradient Checkpointing** for efficient long-sequence processing with reduced memory usage.
+
+```python
+import torch
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+
+model = MambaLMHeadModel.from_pretrained("state-spaces/mamba2-2.7b", device="cuda", dtype=torch.bfloat16)
+model.gradient_checkpointing_enable()
+
+vocab_size = model.config.vocab_size
+sequence_length = 65536
+batch_size = 2
+
+input_ids = torch.randint(0, vocab_size, (batch_size, sequence_length), device="cuda")
+output = model(input_ids=input_ids, num_last_tokens=1)
+
+assert output.logits.shape == (batch_size, 1, vocab_size)
+```
+
+### Text Generation
+
+The `MambaLMHeadModel` supports token-by-token generation using the step function, allowing efficient text generation for long sequences. Below is a minimal example using a pretrained Mamba-2 model:
+
+```python
+import torch
+from transformers import AutoTokenizer
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+import torch.nn.functional as F
+
+tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+tokenizer.pad_token_id = tokenizer.eos_token_id
+model = MambaLMHeadModel.from_pretrained("state-spaces/mamba2-2.7b", device="cuda", dtype=torch.bfloat16)
+prompt_text = "Artificial intelligence has made significant strides in the past decade."
+input_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to("cuda")
+
+generated = []
+max_length = 100
+temperature = 0.7
+
+with torch.no_grad():
+    hidden_states, conv_states, ssm_states = model.backbone.step(input_ids=input_ids)
+
+for _ in range(max_length):
+    logits = model.lm_head(hidden_states[:, -1:, :])
+    probs = F.softmax(logits / temperature, dim=-1)
+    next_token = torch.multinomial(probs.squeeze(1), num_samples=1)
+    generated.append(next_token)
+    with torch.no_grad():
+        hidden_states, conv_states, ssm_states = model.backbone.step(
+            input_ids=next_token, conv_states=conv_states, ssm_states=ssm_states
+        )
+
+generated_tokens = torch.cat(generated, dim=-1)
+generated_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+print(generated_text)
+```
 
 
 ## Pretrained Models
@@ -240,4 +305,10 @@ If you use this codebase, or otherwise find our work valuable, please cite Mamba
   year={2024}
 }
 
+@article{video_ma2mba,
+  title={Look Every Frame All at Once: Video-Ma$^2$mba for Efficient Long-form Video Understanding with Multi-Axis Gradient Checkpointing},
+  author={Lee, Hosu and Kim, Junho and Kim, Hyunjun and Ro, Yong Man},
+  journal={arXiv preprint arXiv:2411.19460},
+  year={2024}
+}
 ```

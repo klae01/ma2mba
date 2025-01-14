@@ -1,4 +1,6 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
+# Copyright (c) 2025, Hosu Lee.
+
 from typing import Optional
 
 import torch
@@ -40,13 +42,56 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-            self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None, **mixer_kwargs
+            self, hidden_states: Tensor, residual: Optional[Tensor] = None, conv_state=None, ssm_state=None, return_cache: bool = False
     ):
         r"""Pass the input through the encoder layer.
 
         Args:
-            hidden_states: the sequence to the encoder layer (required).
-            residual: hidden_states = Mixer(LN(residual))
+            hidden_states (Tensor): The input sequence to the encoder layer. 
+                This is a tensor of shape (batch, sequence_length, hidden_dim) 
+                representing the token embeddings or hidden states from the 
+                previous layer.
+
+            residual (Optional[Tensor], optional): Residual connection tensor. If provided, 
+                the layer applies the residual connection as 
+                `hidden_states = Mixer(LN(residual))`. If not provided, the input 
+                `hidden_states` will be used directly. Default is None.
+
+            conv_state (Optional[Tensor], optional): Convolutional state tensor used by the mixer 
+                layer. This represents additional information needed for 
+                processing sequences with convolutional features. 
+                Shape is (batch, width - 1, dim + 2 * ngroups * dstate). 
+                Default is None.
+
+            ssm_state (Optional[Tensor], optional): State space model (SSM) state tensor 
+                used by the mixer layer. This stores intermediate state information 
+                for SSM-based sequence processing. Shape is 
+                (batch, nheads, headdim, dstate). Default is None.
+
+            return_cache (bool, optional): If True, the layer returns additional 
+                cached states required for future computations. This is useful 
+                for improving efficiency in tasks like autoregressive decoding. 
+                Default is False.
+        Returns:
+            hidden_states (Tensor): 
+                The processed output tensor of shape (batch, sequence_length, hidden_dim), 
+                representing the final hidden states after passing through the mixer layer.
+
+            residual (Tensor): 
+                The residual connection tensor used in the layer, of the same shape as 
+                `hidden_states`. This is either the updated residual or the final hidden states 
+                depending on the normalization and residual connection logic.
+
+            conv_state (Tensor, optional): 
+                If `return_cache=True`, this is the updated convolutional state tensor, used for 
+                maintaining convolutional features in sequential processing. The shape matches 
+                the input `conv_state`. If `return_cache=False`, `conv_state` is not returned.
+
+            ssm_state (Tensor, optional): 
+                If `return_cache=True`, this is the updated state space model (SSM) state tensor, 
+                used for sequential processing in SSM-based layers. The updated `ssm_state` 
+                retains the same shape as the input `ssm_state`. If `return_cache=False`, 
+                `ssm_state` is not returned.
         """
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
@@ -64,7 +109,18 @@ class Block(nn.Module):
                 eps=self.norm.eps,
                 is_rms_norm=isinstance(self.norm, RMSNorm)
             )
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
+
+        kwargs = dict()
+        if conv_state is not None:
+            kwargs.update(conv_state=conv_state)
+        if ssm_state is not None:
+            kwargs.update(ssm_state=ssm_state)
+        if return_cache:
+            kwargs.update(return_cache=return_cache)
+
+        hidden_states = self.mixer(hidden_states, **kwargs)
+        if return_cache:
+            hidden_states, *states = hidden_states
 
         if self.mlp is not None:
             if not self.fused_add_norm:
@@ -81,11 +137,10 @@ class Block(nn.Module):
                     prenorm=True,
                     residual_in_fp32=self.residual_in_fp32,
                     eps=self.norm2.eps,
-                    is_rms_norm=isinstance(self.norm2, RMSNorm)
+                    is_rms_norm=isinstance(self.norm2, RMSNorm),
                 )
             hidden_states = self.mlp(hidden_states)
 
+        if return_cache:
+            return hidden_states, residual, *states
         return hidden_states, residual
-
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
