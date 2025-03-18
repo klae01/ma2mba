@@ -140,6 +140,7 @@ class MixerModel(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+
         self.residual_in_fp32 = residual_in_fp32
         self.activation_checkpointing = False
         self.s_vals_constraint = None
@@ -185,13 +186,13 @@ class MixerModel(nn.Module):
                 _init_weights,
                 n_layer=n_layer,
                 **(initializer_cfg if initializer_cfg is not None else {}),
-                n_residuals_per_layer=(
-                    1 if d_intermediate == 0 else 2
-                ),  # 2 if we have MLP
+                n_residuals_per_layer=(1 if d_intermediate == 0 else 2),  # 2 if we have MLP
             )
         )
 
-    def activation_checkpointing_enable(self, s_vals: list = None, l_vals: list = None):
+    def activation_checkpointing_enable(
+        self, s_vals: Optional[List[int]] = None, l_vals: Optional[List[int]] = None
+    ):
         self.activation_checkpointing = True
         self.s_vals_constraint = s_vals
         self.l_vals_constraint = l_vals
@@ -199,23 +200,32 @@ class MixerModel(nn.Module):
     def activation_checkpointing_disable(self):
         self.activation_checkpointing = False
 
-    def forward(self, input_ids=None, inputs_embeds=None):
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        conv_states: Optional[List[Optional[torch.Tensor]]] = None,
+        ssm_states: Optional[List[Optional[torch.Tensor]]] = None,
+        return_cache: bool = False,
+    ):
         if inputs_embeds is None:
             hidden_states = self.embedding(input_ids)
         else:
             hidden_states = inputs_embeds
 
-        if not self.activation_checkpointing:
-            residual = None
-            for layer in self.layers:
-                hidden_states, residual = layer(hidden_states, residual)
-        else:
-            hidden_states, residual = self.checkpointing_forward(hidden_states)
+        hidden_states, residual, *states = (
+            self.checkpointing_forward
+            if self.activation_checkpointing
+            else self.simple_forward
+        )(
+            hidden_states,
+            conv_states or [None] * len(self.layers),
+            ssm_states or [None] * len(self.layers),
+            return_cache,
+        )
 
         if not self.fused_add_norm:
-            residual = (
-                (hidden_states + residual) if residual is not None else hidden_states
-            )
+            residual = hidden_states + residual if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
             # Set prenorm=False here since we don't need the residual
@@ -229,19 +239,51 @@ class MixerModel(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 is_rms_norm=isinstance(self.norm_f, RMSNorm),
             )
+
+        if return_cache:
+            return hidden_states, *states
         return hidden_states
 
-    def checkpointing_forward(self, hidden_states: torch.Tensor):
+    def simple_forward(
+        self,
+        hidden_states: torch.Tensor,
+        conv_states: List[Optional[torch.Tensor]],
+        ssm_states: List[Optional[torch.Tensor]],
+        return_cache: bool = False,
+    ):
+        return_conv_states = []
+        return_ssm_states = []
+        residual = None
+
+        for layer, conv_state, ssm_state in zip(self.layers, conv_states, ssm_states):
+            output = layer(hidden_states, residual, conv_state, ssm_state, return_cache)
+            hidden_states, residual, *states = output
+            if return_cache:
+                layer_conv_states, layer_ssm_states = states
+                return_conv_states.append(layer_conv_states)
+                return_ssm_states.append(layer_ssm_states)
+
+        if return_cache:
+            return hidden_states, residual, return_conv_states, return_ssm_states
+        return hidden_states, residual
+
+    def checkpointing_forward(
+        self,
+        hidden_states: torch.Tensor,
+        conv_states: List[Optional[torch.Tensor]],
+        ssm_states: List[Optional[torch.Tensor]],
+        return_cache: bool = False,
+    ):
         B, S, F = hidden_states.shape
         L = len(self.layers)
         layer: Mamba2 = self.layers[0].mixer
         dtype_size: int = hidden_states.element_size()
 
-        fp32_multipler = 4 // dtype_size
+        fp32_multiplier = 4 // dtype_size
         # SSM always uses float32
-        ssm_multipler = fp32_multipler
+        ssm_multiplier = fp32_multiplier
         # Residual uses float32 if 'residual_in_fp32' is True
-        res_multipler = fp32_multipler if self.residual_in_fp32 else 1
+        res_multiplier = fp32_multiplier if self.residual_in_fp32 else 1
         assert layer.d_model == F
 
         # conv_states: (batch, dim + 2 * ngroups * dstate, width - 1)
@@ -249,10 +291,10 @@ class MixerModel(nn.Module):
         conv_dim = layer.d_ssm + 2 * layer.ngroups * layer.d_state
         conv_state_size = conv_dim * (layer.d_conv - 1)
         ssm_state_size = layer.d_ssm * layer.d_state
-        block_activation = layer.d_model + layer.d_model * res_multipler
+        block_activation = layer.d_model + layer.d_model * res_multiplier
 
         C_l_ckpt = block_activation
-        C_s_ckpt = conv_state_size + ssm_state_size * ssm_multipler
+        C_s_ckpt = conv_state_size + ssm_state_size * ssm_multiplier
 
         # zxbcdt: batch, seqlen, 2 * d_nonssm + 2 * dim + 2 * ngroups * dstate + nheads
         # out_x: batch, seqlen, nheads, headdim
@@ -268,10 +310,10 @@ class MixerModel(nn.Module):
         # out_x is saved previously in C_grid
         mem_eff_path_conv_state = conv_dim
         mem_eff_path_ssm_state = (
-            layer.nheads * fp32_multipler * 2  # dA_cumsum + dt
-            + layer.d_ssm * layer.d_state * fp32_multipler // layer.chunk_size  # states
+            layer.nheads * fp32_multiplier * 2  # dA_cumsum + dt
+            + layer.d_ssm * layer.d_state * fp32_multiplier // layer.chunk_size  # states
             + layer.d_ssm * layer.d_state // layer.chunk_size  # states
-            + layer.chunk_size * fp32_multipler  # CB
+            + layer.chunk_size * fp32_multiplier  # CB
         )
         restoration_memory = mem_eff_path_conv_state + mem_eff_path_ssm_state
 
@@ -284,8 +326,8 @@ class MixerModel(nn.Module):
         # s * C_state
 
         best_mem = float("inf")
-        best_s = None
-        best_l = None
+        best_s = S
+        best_l = L
 
         for s in self.s_vals_constraint or range(layer.chunk_size, S + 1, layer.chunk_size):
             for l in self.l_vals_constraint or range(1, L + 1):
@@ -301,17 +343,19 @@ class MixerModel(nn.Module):
 
         hidden_state_chunks = list(hidden_states.split(best_s, dim=1))
         residual_chunks = [None] * len(hidden_state_chunks)
+        return_conv_states = []
+        return_ssm_states = []
 
         for layer_start in range(0, L, best_l):
-            layers = self.layers[layer_start : layer_start + best_l]
-            layer_conv_states = [None] * len(layers)
-            layer_ssm_states = [None] * len(layers)
+            rng = slice(layer_start, layer_start + best_l)
+            layer_conv_states = conv_states[rng]
+            layer_ssm_states = ssm_states[rng]
 
             for i in range(len(hidden_state_chunks)):
-                return_state = i < len(hidden_state_chunks) - 1
+                return_state = return_cache if i == len(hidden_state_chunks) - 1 else True
                 output = torch.utils.checkpoint.checkpoint(
                     self.partial_forward,
-                    layers,
+                    self.layers[rng],
                     hidden_state_chunks[i],
                     residual_chunks[i],
                     layer_conv_states,
@@ -324,16 +368,28 @@ class MixerModel(nn.Module):
                 if return_state:
                     layer_conv_states, layer_ssm_states = states
 
+            if return_cache:
+                return_conv_states.extend(layer_conv_states)
+                return_ssm_states.extend(layer_ssm_states)
+
+        if return_cache:
+            return (
+                torch.cat(hidden_state_chunks, 1),
+                torch.cat(residual_chunks, 1),
+                return_conv_states,
+                return_ssm_states,
+            )
+
         return torch.cat(hidden_state_chunks, 1), torch.cat(residual_chunks, 1)
 
     @classmethod
     def partial_forward(
         cls,
-        layers: list[nn.Module],
+        layers: List[nn.Module],
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        conv_states: list[torch.TensorType | None],
-        ssm_states: list[torch.TensorType | None],
+        residual: Optional[torch.Tensor],
+        conv_states: List[Optional[torch.Tensor]],
+        ssm_states: List[Optional[torch.Tensor]],
         return_cache: bool,
     ):
         return_conv_states = []
@@ -357,10 +413,10 @@ class MixerModel(nn.Module):
     @torch.no_grad()
     def step(
         self,
-        input_ids=None,
-        inputs_embeds=None,
-        conv_states: List[Optional[torch.Tensor]] = None,
-        ssm_states: List[Optional[torch.Tensor]] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        conv_states: Optional[List[Optional[torch.Tensor]]] = None,
+        ssm_states: Optional[List[Optional[torch.Tensor]]] = None,
     ):
         if inputs_embeds is None:
             hidden_states = self.embedding(input_ids)
@@ -370,11 +426,8 @@ class MixerModel(nn.Module):
         assert torch.is_tensor(hidden_states)
         assert hidden_states.ndim == 3
 
-        if conv_states is None:
-            conv_states = [None] * len(self.layers)
-        if ssm_states is None:
-            ssm_states = [None] * len(self.layers)
-
+        conv_states = conv_states or [None] * len(self.layers)
+        ssm_states = ssm_states or [None] * len(self.layers)
         residual = None
         for i, layer in enumerate(self.layers):
             hidden_states, residual, conv_states[i], ssm_states[i] = layer(
@@ -385,9 +438,7 @@ class MixerModel(nn.Module):
         residual = residual[:, -1:, :]
 
         if not self.fused_add_norm:
-            residual = (
-                (hidden_states + residual) if residual is not None else hidden_states
-            )
+            residual = hidden_states + residual if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
             hidden_states = layer_norm_fn(
@@ -405,7 +456,6 @@ class MixerModel(nn.Module):
 
 
 class MambaLMHeadModel(nn.Module, GenerationMixin):
-
     def __init__(
         self,
         config: MambaConfig,
@@ -460,7 +510,14 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         if self.config.tie_embeddings:
             self.lm_head.weight = self.backbone.embedding.weight
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, **mixer_kwargs):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        inference_params=None,
+        num_last_tokens=0,
+        **mixer_kwargs,
+    ):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
@@ -478,7 +535,9 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         config_data = load_config_hf(pretrained_model_name)
         config = MambaConfig(**config_data)
         model = cls(config, device=device, dtype=dtype, **kwargs)
-        model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype))
+        model.load_state_dict(
+            load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype)
+        )
         return model
 
     def save_pretrained(self, save_directory):
