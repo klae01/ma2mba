@@ -428,11 +428,15 @@ class MixerModel(nn.Module):
 
         conv_states = conv_states or [None] * len(self.layers)
         ssm_states = ssm_states or [None] * len(self.layers)
+        return_conv_states = []
+        return_ssm_states = []
         residual = None
-        for i, layer in enumerate(self.layers):
-            hidden_states, residual, conv_states[i], ssm_states[i] = layer(
-                hidden_states, residual, conv_states[i], ssm_states[i], True
+        for layer, conv_state, ssm_state in zip(self.layers, conv_states, ssm_states):
+            hidden_states, residual, conv_state_out, ssm_state_out = layer(
+                hidden_states, residual, conv_state, ssm_state, True
             )
+            return_conv_states.append(conv_state_out)
+            return_ssm_states.append(ssm_state_out)
 
         hidden_states = hidden_states[:, -1:, :]
         residual = residual[:, -1:, :]
@@ -452,7 +456,7 @@ class MixerModel(nn.Module):
                 is_rms_norm=isinstance(self.norm_f, RMSNorm),
             )
 
-        return hidden_states, conv_states, ssm_states
+        return hidden_states, return_conv_states, return_ssm_states
 
 
 class MambaLMHeadModel(nn.Module, GenerationMixin):
