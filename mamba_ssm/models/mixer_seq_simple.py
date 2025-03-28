@@ -204,6 +204,7 @@ class MixerModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
         conv_states: Optional[List[Optional[torch.Tensor]]] = None,
         ssm_states: Optional[List[Optional[torch.Tensor]]] = None,
         return_cache: bool = False,
@@ -219,6 +220,7 @@ class MixerModel(nn.Module):
             else self.simple_forward
         )(
             hidden_states,
+            seq_idx,
             conv_states or [None] * len(self.layers),
             ssm_states or [None] * len(self.layers),
             return_cache,
@@ -247,6 +249,7 @@ class MixerModel(nn.Module):
     def simple_forward(
         self,
         hidden_states: torch.Tensor,
+        seq_idx: Optional[torch.Tensor],
         conv_states: List[Optional[torch.Tensor]],
         ssm_states: List[Optional[torch.Tensor]],
         return_cache: bool = False,
@@ -256,7 +259,7 @@ class MixerModel(nn.Module):
         residual = None
 
         for layer, conv_state, ssm_state in zip(self.layers, conv_states, ssm_states):
-            output = layer(hidden_states, residual, conv_state, ssm_state, return_cache)
+            output = layer(hidden_states, residual, seq_idx, conv_state, ssm_state, return_cache)
             hidden_states, residual, *states = output
             if return_cache:
                 layer_conv_states, layer_ssm_states = states
@@ -270,6 +273,7 @@ class MixerModel(nn.Module):
     def checkpointing_forward(
         self,
         hidden_states: torch.Tensor,
+        seq_idx: Optional[torch.Tensor],
         conv_states: List[Optional[torch.Tensor]],
         ssm_states: List[Optional[torch.Tensor]],
         return_cache: bool = False,
@@ -358,6 +362,7 @@ class MixerModel(nn.Module):
                     self.layers[rng],
                     hidden_state_chunks[i],
                     residual_chunks[i],
+                    seq_idx,
                     layer_conv_states,
                     layer_ssm_states,
                     return_state,

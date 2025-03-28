@@ -153,9 +153,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
 
-    def forward(self, u, conv_state=None, ssm_state=None, return_cache: bool = False):
+    def forward(self, u, seq_idx=None, conv_state=None, ssm_state=None, return_cache: bool = False):
         """
         u: (batch, seqlen, hidden_dim)
+        seq_idx: (batch, seqlen)
         conv_state: (batch, width - 1, dim + 2 * ngroups * dstate)
         ssm_state: (batch, nheads, headdim, dstate)
         Returns: same shape as u
@@ -188,7 +189,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             chunk_size=self.chunk_size,
             initial_conv_states=None if conv_state is None else conv_state.transpose(1, 2),
             initial_ssm_states=ssm_state,
-            seq_idx=None,
+            seq_idx=seq_idx,
             return_final_states=return_cache,
             activation=self.activation,
             rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
@@ -221,6 +222,12 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     )
                 else:
                     conv_state = torch.cat([zxbcdt.new_zeros([batch, pad_length, xBC.size(-1)]), xBC], 1)
+                if seq_idx is not None:
+                    ignored = torch.zeros_like(conv_state, dtype=torch.bool)
+                    unmatch = seq_idx[:, -update_length:] != seq_idx[:, -1:]
+                    ignored[:, -unmatch.size(1):] = unmatch
+                    ignored = ignored.flip(1).cummax(1).flip(1)
+                    conv_state.masked_fill_(ignored, 0)
             else:
                 conv_state = None
         if self.process_group is not None:

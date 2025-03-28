@@ -42,7 +42,7 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-            self, hidden_states: Tensor, residual: Optional[Tensor] = None, conv_state=None, ssm_state=None, return_cache: bool = False
+            self, hidden_states: Tensor, residual: Optional[Tensor] = None, seq_idx: Optional[Tensor] = None, conv_state=None, ssm_state=None, return_cache: bool = False
     ):
         r"""Pass the input through the encoder layer.
 
@@ -56,6 +56,13 @@ class Block(nn.Module):
                 the layer applies the residual connection as 
                 `hidden_states = Mixer(LN(residual))`. If not provided, the input 
                 `hidden_states` will be used directly. Default is None.
+
+            seq_idx (Optional[Tensor], optional): A tensor representing the sequence indices 
+                for each token in the input. This can be used to track the temporal or 
+                positional order of tokens—especially useful when caching states for 
+                autoregressive or incremental processing. Its shape is (batch, sequence_length)
+                and it allows the module to determine which tokens correspond to the current
+                time step and to handle padding or state reset appropriately.
 
             conv_state (Optional[Tensor], optional): Convolutional state tensor used by the mixer 
                 layer. This represents additional information needed for 
@@ -111,6 +118,8 @@ class Block(nn.Module):
             )
 
         kwargs = dict()
+        if seq_idx is not None:
+            kwargs.update(seq_idx=seq_idx)
         if conv_state is not None:
             kwargs.update(conv_state=conv_state)
         if ssm_state is not None:
