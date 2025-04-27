@@ -417,6 +417,7 @@ class MixerModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         conv_states: Optional[List[Optional[torch.Tensor]]] = None,
         ssm_states: Optional[List[Optional[torch.Tensor]]] = None,
+        cache_inplace: bool = False,
     ):
         if inputs_embeds is None:
             hidden_states = self.embedding(input_ids)
@@ -433,7 +434,7 @@ class MixerModel(nn.Module):
         residual = None
         for layer, conv_state, ssm_state in zip(self.layers, conv_states, ssm_states):
             hidden_states, residual, conv_state_out, ssm_state_out = layer(
-                hidden_states, residual, conv_state, ssm_state, True
+                hidden_states, residual, conv_state, ssm_state, True, cache_inplace
             )
             return_conv_states.append(conv_state_out)
             return_ssm_states.append(ssm_state_out)

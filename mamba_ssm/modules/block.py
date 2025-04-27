@@ -42,7 +42,7 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-            self, hidden_states: Tensor, residual: Optional[Tensor] = None, conv_state=None, ssm_state=None, return_cache: bool = False
+            self, hidden_states: Tensor, residual: Optional[Tensor] = None, conv_state=None, ssm_state=None, return_cache: bool = False, cache_inplace: bool = False
     ):
         r"""Pass the input through the encoder layer.
 
@@ -117,6 +117,8 @@ class Block(nn.Module):
             kwargs.update(ssm_state=ssm_state)
         if return_cache:
             kwargs.update(return_cache=return_cache)
+        if return_cache:
+            kwargs.update(cache_inplace=cache_inplace)
 
         hidden_states = self.mixer(hidden_states, **kwargs)
         if return_cache:

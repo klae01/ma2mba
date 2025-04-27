@@ -153,7 +153,14 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
 
-    def forward(self, u, conv_state=None, ssm_state=None, return_cache: bool = False):
+    def forward(
+        self,
+        u,
+        conv_state=None,
+        ssm_state=None,
+        return_cache: bool = False,
+        cache_inplace: bool = False,
+    ):
         """
         u: (batch, seqlen, hidden_dim)
         conv_state: (batch, width - 1, dim + 2 * ngroups * dstate)
@@ -170,7 +177,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     "please wrap your code in 'torch.no_grad()' to ensure proper execution."
                 )
             else:
-                return self.step(u, conv_state, ssm_state)
+                return self.step(u, conv_state, ssm_state, cache_inplace=cache_inplace)
 
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
         # If the model is loaded in fp16, without the .float() here, A might be -inf
@@ -189,7 +196,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             initial_conv_states=None if conv_state is None else conv_state.transpose(1, 2),
             initial_ssm_states=ssm_state,
             seq_idx=None,
-            return_final_states=return_cache,
+            return_final_states=return_cache or cache_inplace,
             activation=self.activation,
             rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
             rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
@@ -200,8 +207,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             norm_before_gate=self.norm_before_gate,
             **dt_limit_kwargs,
         )
-        if return_cache:
-            out, ssm_state = out
+
+        if return_cache or cache_inplace:
+            out, ssm_state_ = out
+            if cache_inplace and ssm_state is not None:
+                ssm_state.copy_(ssm_state_)
+            else:
+                ssm_state = ssm_state_
 
             if self.d_conv > 1:
                 d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
@@ -210,19 +222,25 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     :, :, 2 * d_mlp + self.d_ssm : 2 * d_mlp + 2 * self.d_ssm + 2 * self.ngroups * self.d_state
                 ]
                 update_length = self.d_conv - 1
-                new_length = xBC.size(1)
                 reuse_length = 0 if conv_state is None else min(conv_state.size(1), update_length - new_length)
                 pad_length = update_length - new_length - reuse_length
+
+                conv_state_parts = []
                 if new_length >= update_length:
-                    conv_state = xBC[:, -update_length:, :].clone()
-                elif reuse_length > 0:
-                    conv_state = torch.cat(
-                        [zxbcdt.new_zeros([batch, pad_length, xBC.size(-1)]), conv_state[:, -reuse_length:, :], xBC], 1
-                    )
+                    conv_state_parts.append(xBC[:, -update_length:, :])
                 else:
-                    conv_state = torch.cat([zxbcdt.new_zeros([batch, pad_length, xBC.size(-1)]), xBC], 1)
+                    conv_state_parts.append(xBC.new_zeros([batch, pad_length, xBC.size(-1)]))
+                    if reuse_length > 0:
+                        conv_state_parts.append(conv_state[:, -reuse_length:, :])
+                    conv_state_parts.append(xBC)
+
+                if cache_inplace and conv_state is not None:
+                    torch.cat(conv_state_parts, 1, out=conv_state)
+                else:
+                    conv_state = torch.cat(conv_state_parts, 1)
             else:
                 conv_state = None
+
         if self.process_group is not None:
             reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
             out = reduce_fn(out, self.process_group)
@@ -231,19 +249,25 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         return out
 
     @torch.no_grad()
-    def step(self, hidden_states, conv_state=None, ssm_state=None):
+    def step(self, hidden_states, conv_state=None, ssm_state=None, cache_inplace=False):
         assert hidden_states.ndim == 3
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
 
         conv_state = (
-            conv_state.clone()
+            (conv_state if cache_inplace else conv_state.clone())
             if conv_state is not None
-            else self.conv1d.weight.new_zeros((hidden_states.shape[0], self.d_conv - 1, self.conv1d.weight.shape[0]))
+            else hidden_states.new_zeros(
+                (hidden_states.shape[0], self.d_conv - 1, self.conv1d.weight.shape[0]),
+                dtype=torch.float32,
+            )
         )
         ssm_state = (
-            ssm_state.clone()
+            (ssm_state if cache_inplace else ssm_state.clone())
             if ssm_state is not None
-            else self.in_proj.weight.new_zeros((hidden_states.shape[0], self.nheads, self.headdim, self.d_state))
+            else hidden_states.new_zeros(
+                (hidden_states.shape[0], self.nheads, self.headdim, self.d_state),
+                dtype=torch.float32,
+            )
         )
 
         zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B, 2D)
