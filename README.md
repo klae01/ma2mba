@@ -27,16 +27,34 @@ with an efficient hardware-aware design and implementation in the spirit of [Fla
 
 ## Installation
 
-- `MAMBA_FORCE_BUILD=TRUE pip install . --no-build-isolation --no-binary :all:`
-- `pip install causal-conv1d>=1.4.0 triton`
+Due to partial CUDA compilation requirements, you need to install the original `mamba_ssm` package and include this repository (`ma2mba`) at the front of your Python path:
 
-Other requirements:
-- Linux
-- NVIDIA GPU
-- PyTorch 1.12+
-- CUDA 11.6+
+1. Clone this repository:
 
-For AMD cards, see additional prerequisites below.
+   ```sh
+   git clone https://github.com/klae01/ma2mba.git
+   ```
+
+2. Install the original packages from PyPI:
+
+   ```sh
+   pip install mamba-ssm causal-conv1d
+   ```
+
+3. Add `ma2mba` to the front of your `PYTHONPATH`:
+
+   ```sh
+   export PYTHONPATH=/path/to/ma2mba:$PYTHONPATH
+   ```
+
+   *(Replace `/path/to/ma2mba` with your local repository path.)*
+
+   Alternatively, in Python scripts:
+
+   ```python
+   import sys
+   sys.path.insert(0, "/path/to/ma2mba")
+   ```
 
 ## Usage
 
@@ -247,36 +265,6 @@ With Mamba-2, you just need to change the model name:
 ``` sh
 python benchmarks/benchmark_generation_mamba_simple.py --model-name "state-spaces/mamba2-2.7b" --prompt "My cat wrote all this CUDA code for a new language model and" --topp 0.9 --temperature 0.7 --repetition-penalty 1.2
 ```
-
-
-## Troubleshooting
-
-### Precision
-Our models were trained using PyTorch [AMP](https://pytorch.org/docs/stable/amp.html) for mixed precision. AMP keeps model parameters in float32 and casts to half precision when necessary.
-On the other hand, other frameworks like DeepSpeed store parameters in float16 and upcasts when necessary (e.g. for optimizer accumulation).
-
-We've observed that higher precision for the main model parameters may be necessary, because SSMs are sensitive to their recurrent dynamics. If you are experiencing instabilities,
-as a first step please try a framework storing parameters in fp32 (such as AMP).
-
-### Initialization
-Some parts of the model have initializations inherited from prior work on S4 models.
-For [example](https://github.com/state-spaces/mamba/blob/f0affcf69f06d1d06cef018ff640bf080a11c421/mamba_ssm/modules/mamba_simple.py#L102), the $\Delta$ parameter has a targeted range by initializing the bias of its linear projection.
-However, some frameworks may have post-initialization hooks (e.g. setting all bias terms in `nn.Linear` modules to zero).
-If this is the case, you may have to add custom logic (e.g. this [line](https://github.com/state-spaces/mamba/blob/f0affcf69f06d1d06cef018ff640bf080a11c421/mamba_ssm/modules/mamba_simple.py#L104) turns off re-initializing in our trainer, but would be a no-op in any other framework)
-that is specific to the training framework.
-
-## Additional Prerequisites for AMD cards
-
-### Patching ROCm
-
-If you are on ROCm 6.0, run the following steps to avoid errors during compilation. This is not required for ROCm 6.1 onwards.
-
-1. Locate your ROCm installation directory. This is typically found at `/opt/rocm/`, but may vary depending on your installation.
-
-2. Apply the Patch. Run with `sudo` in case you encounter permission issues.
-   ```bash
-    patch /opt/rocm/include/hip/amd_detail/amd_hip_bf16.h < rocm_patch/rocm6_0.patch 
-   ```
 
 
 ## Citation
